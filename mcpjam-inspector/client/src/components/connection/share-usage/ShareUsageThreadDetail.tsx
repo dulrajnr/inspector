@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatDistanceToNow } from "date-fns";
 import { Copy, FlaskConical, Loader2, MessageSquare } from "lucide-react";
 import { toast } from "sonner";
@@ -30,7 +30,6 @@ import {
   useSessionBrowserArtifacts,
   type SharedChatTurnTrace,
 } from "@/hooks/useSharedChatThreads";
-import { SessionInsightBar } from "@/components/scenarios/session-readiness";
 import { ErrorBoundary } from "@/components/ui/error-boundary";
 import { SessionScoredTranscript } from "@/components/connection/share-usage/session-scored-transcript";
 import {
@@ -42,20 +41,16 @@ import { navigateToPromotedTestCase } from "@/components/chat-v2/shared/promote-
 import { useAction } from "convex/react";
 import { Gavel, RotateCcw } from "lucide-react";
 import { JudgeVerdictCard } from "@/components/shared/session-quality/judge-presentation";
-import { SessionChecksSection } from "./SessionChecksSection";
 import type { SharedChatThread } from "@/hooks/useSharedChatThreads";
 
 const EMPTY_SPANS: EvalTraceSpan[] = [];
 
 /**
- * Goal-completion judge section for SWARM sessions — rendered under the
- * readiness insight bar so the verdict is visible on every tab. States:
- * absent → explicit first-run affordance; completed → shared JudgeVerdictCard
- * + a Re-judge affordance; failed → "Judge unavailable" + Retry (a failed
- * judgment must be recoverable, not hidden); running → judging placeholder.
- * All controls call the backend `requestSwarmSessionJudge` (sessionId only —
- * goal/run/project are server-derived) and rely on the reactive thread
- * subscription to refresh.
+ * Goal-completion judge section for SWARM sessions — auto-runs on open when
+ * no verdict exists yet. States: pending/running → judging placeholder;
+ * completed → shared JudgeVerdictCard + Re-judge; failed → "Judge unavailable"
+ * + Retry. Calls `requestSwarmSessionJudge` (sessionId only) and refreshes
+ * via the reactive thread subscription.
  */
 export function SwarmJudgeSection({
   threadId,
@@ -68,8 +63,9 @@ export function SwarmJudgeSection({
     "swarmJudge:requestSwarmSessionJudge" as never
   ) as unknown as (args: { sessionId: string }) => Promise<unknown>;
   const [requesting, setRequesting] = useState(false);
+  const autoAttemptedRef = useRef(false);
 
-  const rerun = async () => {
+  const rerun = useCallback(async () => {
     setRequesting(true);
     try {
       await requestJudge({ sessionId: threadId });
@@ -80,9 +76,20 @@ export function SwarmJudgeSection({
     } finally {
       setRequesting(false);
     }
-  };
+  }, [requestJudge, threadId]);
 
-  const judging = requesting || goalScore?.status === "running";
+  useEffect(() => {
+    autoAttemptedRef.current = false;
+  }, [threadId]);
+
+  useEffect(() => {
+    if (goalScore || autoAttemptedRef.current) return;
+    autoAttemptedRef.current = true;
+    void rerun();
+  }, [goalScore, rerun]);
+
+  const judging =
+    requesting || goalScore?.status === "running" || !goalScore;
 
   return (
     <div className="shrink-0 space-y-1.5 px-4 pt-2">
@@ -90,26 +97,6 @@ export function SwarmJudgeSection({
         <div className="flex items-center gap-2 rounded-lg border border-border/50 bg-muted/15 px-3 py-2 text-xs text-muted-foreground">
           <Loader2 className="size-3.5 animate-spin" aria-hidden />
           Judging against the journey goal…
-        </div>
-      ) : !goalScore ? (
-        <div className="flex items-center gap-2 rounded-lg border border-border/50 bg-muted/15 px-3 py-2 text-xs">
-          <Gavel
-            className="size-3.5 shrink-0 text-muted-foreground"
-            aria-hidden
-          />
-          <span className="text-muted-foreground">
-            Check this session against the journey goal.
-          </span>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="ml-auto shrink-0 rounded-xl"
-            onClick={() => void rerun()}
-          >
-            <Gavel className="mr-1.5 size-3.5" />
-            Run judge
-          </Button>
         </div>
       ) : goalScore.status === "completed" &&
         typeof goalScore.score === "number" &&
@@ -481,13 +468,7 @@ export function ShareUsageThreadDetail({
     if (thread.sourceType === "swarm") {
       return (
         <div className="flex h-full flex-col">
-          {thread.readiness ? (
-            <SessionInsightBar readiness={thread.readiness} />
-          ) : null}
           <SwarmJudgeSection threadId={threadId} goalScore={thread.goalScore} />
-          {/* A transcript-less attempt is exactly where a runner failure
-              shows up, so the checks block belongs on this shell too. */}
-          <SessionChecksSection chatSessionId={thread._id} />
           <div className="flex flex-1 items-center justify-center">
             <p className="text-sm text-muted-foreground">
               No messages in this session
@@ -636,25 +617,9 @@ export function ShareUsageThreadDetail({
         </div>
       </div>
 
-      {/* Gated on the verdict existing, not on the session being synthetic:
-          readiness is computed for real User Testing sessions too, and a
-          surface that has the data should show it. */}
-      {thread.readiness ? (
-        <SessionInsightBar readiness={thread.readiness} />
-      ) : null}
-
-      {/* Swarm-only: render before the first score exists so deployments with
-          automatic judging disabled still expose the on-demand entry point. */}
       {thread.sourceType === "swarm" ? (
         <SwarmJudgeSection threadId={threadId} goalScore={thread.goalScore} />
       ) : null}
-
-      {/* Deterministic checks, in their own block below the judge rather than
-          merged into it: one is a rule that held or did not, the other an
-          LLM's opinion, and a reader must not weigh them as the same kind of
-          fact. Not swarm-gated — User Testing sessions get graded too — and
-          self-hiding when the session carries no check rows. */}
-      <SessionChecksSection chatSessionId={thread._id} />
 
       {/* Trace / Chat / [Browser] / Raw tabs. The Browser tab appears when the
           session carries browser-rendered MCP App artifacts (synthetic runs);
