@@ -30,10 +30,14 @@
  *
  * What this module deliberately does NOT do:
  *
- *   - It never derives `failureCategory: "metadata"`. That category means
- *     "tool names, descriptions or schemas misled the model", which is a
- *     judgement about intent that no span carries. Deriving it mechanically
- *     would be guessing, so it is left to a later, evidence-carrying step.
+ *   - It never GUESSES `failureCategory: "metadata"` from the deterministic
+ *     evidence alone. That category means "tool names, descriptions or
+ *     schemas misled the model", which is a judgement about intent that no
+ *     span carries on its own. `categoryFor`'s `selection` branch below is
+ *     reachable, but ONLY through `evidence.metadataAttribution` — a scored,
+ *     evidence-carrying verdict from the D7 judge (attributed elsewhere:
+ *     `metadata-attribution` second-pass). No deterministic span or predicate
+ *     ever produces it.
  *   - It never enforces policy. A policy block is REPRESENTED here
  *     (`notMeasured` + `blockedByPolicy`); enforcing it belongs elsewhere.
  *   - It never reads `finishReason`. That field is advisory display only and
@@ -61,7 +65,7 @@ import {
  * reason `sessionReadiness` stamps `READINESS_ANALYZER_VERSION` on every
  * record it writes.
  */
-export const STAGE_ANALYZER_VERSION = 3;
+export const STAGE_ANALYZER_VERSION = 5;
 
 /**
  * Why a stage landed where it did.
@@ -257,6 +261,38 @@ export type StageAuthoredCase = {
   expectsWidgetRender?: boolean;
   /** Count of authored user-value assertions (predicates, expectedOutput). */
   assertionCount?: number;
+  /**
+   * A real user ask exists in this session/case — someone wanted something.
+   *
+   * D8. Eval cases derive `userValue` applicability from `assertionCount`
+   * alone, which is right for an authored case: the assertions ARE the ask.
+   * A chat session has an ask with no assertions attached to it, and the two
+   * possible answers are not the same claim:
+   *
+   *   - ask present, no user-value grader ⇒ `userValue: notMeasured`. Someone
+   *     wanted something and nothing here can say whether they got it.
+   *   - no ask at all ⇒ `userValue: notApplicable`. There is nothing to
+   *     satisfy, so there is no gap to close.
+   *
+   * Absent (the eval default) leaves the pre-D8 behaviour byte-identical.
+   */
+  hasUserAsk?: boolean;
+  /**
+   * What the ask says about whether a tool SHOULD have been called.
+   *
+   *   - `required`     — a call is part of the assertion (equivalent to
+   *                      `expectsToolCall: true`, and it composes with it).
+   *   - `not_required` — nothing here expects a call; `call` applicability
+   *                      falls back to the authored signals alone.
+   *   - `open`         — a real chat ask, where whether a tool was needed is
+   *                      genuinely unknown. `call`/`response` become
+   *                      applicable so observed spans can decide them, and
+   *                      `selection` can NEVER be `passed` off a bare call:
+   *                      that a tool ran is not evidence the RIGHT tool ran.
+   *
+   * Absent (the eval default) leaves the pre-D8 behaviour byte-identical.
+   */
+  toolExpectation?: "required" | "not_required" | "open";
 };
 
 /**
@@ -272,6 +308,21 @@ export type StageSetupPhaseSignal = {
   egressVerified?: boolean;
   /** Culprit synthetic-span ids (`run-connect-<id>` / `run-toolslist-<id>`). */
   spanIds?: string[];
+  /**
+   * How long this setup PHASE took, in milliseconds — its wall-clock envelope.
+   *
+   * A RUN-LEVEL fact that happens to be copied onto every iteration so the
+   * derivation above can read it per-iteration. Analytics must count it ONCE
+   * per run+phase: a run with 200 trials copies one 3-second connect onto all
+   * 200 of them, and a consumer that treats each copy as a sample reports a
+   * 3-second connection latency measured 200 times.
+   *
+   * Deliberately NOT a source of per-trial `connection` / `discovery` latency —
+   * see `STAGE_LATENCY_ELIGIBLE_STAGES` in `./stage-measurements.ts`. This
+   * field is inert to `deriveStageResults`, which never reads it: timing must
+   * not move a stage's state.
+   */
+  durationMs?: number;
 };
 
 export type StageSetupSignals = {
@@ -318,6 +369,31 @@ export type StageEvidence = {
     pendingKind?: "scheduled" | "not_requested";
     verdict?: "pass" | "partial" | "fail";
     /** Bounded by the EXISTING evidence caps, same as predicate reasons. */
+    reasons?: readonly string[];
+  };
+  /**
+   * D7's advisory judge: did the server's OWN tool metadata (names,
+   * descriptions, schemas) mislead the model into a wrong or missing tool
+   * choice? Same tier-2 shape as `judgeEvidence` — a report-only LLM
+   * round trip consulted only where `selection` already failed
+   * deterministically (`missingToolCall` / `unexpectedToolCall`).
+   *
+   * Answers a BINARY attribution question, not a graded band: there is no
+   * `judgeEvidence`-style `verdict` scale here, because "did the metadata
+   * cause this?" has no meaningful partial answer the way "did the user get
+   * what they wanted?" does.
+   */
+  metadataAttribution?: {
+    status: "scored" | "error" | "skipped" | "not_applicable" | "pending";
+    /** `pending` only, same split as `judgeEvidence.pendingKind`. */
+    pendingKind?: "scheduled" | "not_requested";
+    /** `true` ⇒ the judge concluded the server's tool metadata caused the miss. */
+    attributed?: boolean;
+    /**
+     * Quoted evidence (description text vs. the ask) plus a one-line
+     * rationale. Bounded by the EXISTING evidence caps, same as predicate
+     * and judge reasons.
+     */
     reasons?: readonly string[];
   };
 };
@@ -401,8 +477,18 @@ function applicability(
 ): Record<UserValueStage, boolean> {
   // A case that expects no tool call but IS a negative case still exercises
   // `call`: proving no call happened is the assertion.
+  //
+  // D8: an `open` tool expectation ALSO turns `call` on. A real chat ask has
+  // no authored expectation to read, but the spans it produced can still say
+  // whether a call was made and whether it worked — and a stage whose evidence
+  // we are about to inspect must not be pre-declared inapplicable. `open` with
+  // no call observed stays `notMeasured` (deriveCall's floor), which is the
+  // honest answer: we do not know whether one was needed.
   const callApplies =
-    authored.expectsToolCall === true || authored.isNegativeTest === true;
+    authored.expectsToolCall === true ||
+    authored.isNegativeTest === true ||
+    authored.toolExpectation === "required" ||
+    authored.toolExpectation === "open";
   return {
     // Every run must reach a server and read its tools, whatever it asserts.
     connection: true,
@@ -414,9 +500,13 @@ function applicability(
     // render observations directly. Gating this on `callApplies` alone would
     // make `renderFailed` unreachable for a pure render probe.
     response: callApplies || authored.expectsWidgetRender === true,
+    // D8: a real ask makes `userValue` applicable even with nothing authored
+    // to grade it. `notApplicable` would say "there was nothing to satisfy",
+    // which is false the moment someone asked for something.
     userValue:
       (authored.assertionCount ?? 0) > 0 ||
-      authored.expectsWidgetRender === true,
+      authored.expectsWidgetRender === true ||
+      authored.hasUserAsk === true,
   };
 }
 
@@ -526,8 +616,50 @@ const promptIndexes = (prompts: readonly StagePromptSummaryLike[]): number[] =>
     .map((p) => p.promptIndex)
     .filter((i): i is number => typeof i === "number");
 
-function deriveSelection(e: StageEvidence): StageResultRow {
+/**
+ * D8 guard: a bare tool call is not evidence the RIGHT tool was chosen.
+ *
+ * `deriveSelection`'s pre-D8 floor for a turn summary with no `missing` and no
+ * `unexpected` is `passed/observed` — correct for an AUTHORED case, where the
+ * summary is the verdict of a comparison against declared expectations. A chat
+ * session declares none: its turn summaries (if a caller ever supplies any)
+ * compare against nothing, so "no missing calls" is vacuous rather than a pass.
+ *
+ * Under `toolExpectation: "open"` a `passed` selection therefore requires at
+ * least one turn that actually declared expected calls. Everything else
+ * degrades to `notMeasured` — never to `failed`, which would invent a defect
+ * out of the same silence.
+ */
+function selectionNeedsExplicitEvidence(
+  authored: StageAuthoredCase,
+  prompts: readonly StagePromptSummaryLike[]
+): boolean {
+  if (authored.toolExpectation !== "open") return false;
+  return !prompts.some((p) => nonEmpty(p.expectedToolCalls));
+}
+
+function deriveSelection(
+  e: StageEvidence,
+  authored: StageAuthoredCase
+): StageResultRow {
   const prompts = e.prompts ?? [];
+  if (selectionNeedsExplicitEvidence(authored, prompts)) {
+    // No trace at all outranks both branches below, the same way it does in
+    // `deriveCall` and `deriveResponse`. "The run recorded no trace" and "a
+    // sink existed and captured nothing" are different facts, and reporting
+    // the second for the first tells an operator to go looking at an empty
+    // channel that was never written.
+    if (e.traceAbsent) return row("selection", "notMeasured", "traceAbsent");
+    // Calls happened but nothing adjudicates them ⇒ the verdict is
+    // unavailable. Nothing happened at all ⇒ nothing was captured. Two
+    // different sentences for an operator, so they keep two reason codes.
+    const tools = (e.spans ?? []).filter(isToolSpan);
+    return tools.length > 0
+      ? row("selection", "notMeasured", "matchVerdictUnavailable", {
+          spanIds: spanIds(tools).slice(0, 5),
+        })
+      : row("selection", "notMeasured", "noEvidenceCaptured");
+  }
   if (prompts.length > 0) {
     // A missing expected call is fatal in EVERY match mode, so it needs no
     // adjudication: `evaluateToolCalls` cannot return `passed` with a
@@ -762,10 +894,14 @@ function boundedJudgeReasons(
 /**
  * The coarse bucket a failing run is grouped under.
  *
- * `metadata` is never produced (see the module docblock). `evaluator` is only
- * reached when the grader is the ONLY thing that broke — a run whose server
- * demonstrably failed is reported against the server, and an evaluator error
- * on top of that does not launder it.
+ * `metadata` is reachable ONLY through `evidence.metadataAttribution` — D7's
+ * advisory judge, consulted after `selection` already failed
+ * deterministically. No deterministic span or predicate ever selects it: a
+ * `selection` failure with no attribution verdict (or one that scored
+ * `attributed: false`) stays `"selection"`, the same as before D7 shipped.
+ * `evaluator` is only reached when the grader is the ONLY thing that broke —
+ * a run whose server demonstrably failed is reported against the server, and
+ * an evaluator error on top of that does not launder it.
  */
 function categoryFor(
   firstFailed: UserValueStage | undefined,
@@ -780,8 +916,19 @@ function categoryFor(
     case "connection":
     case "discovery":
       return "setup";
-    case "selection":
-      return "selection";
+    case "selection": {
+      const attribution = evidence.metadataAttribution;
+      // Quoted evidence is required, not optional decoration: a `metadata`
+      // classification with nothing backing it is unauditable, and
+      // `mergeMetadataAttributionEvidence` below already no-ops without it —
+      // so recoloring here without the same check would claim a category
+      // whose own row carries no supporting evidence at all.
+      return attribution?.status === "scored" &&
+        attribution.attributed === true &&
+        boundedJudgeReasons(attribution.reasons) !== undefined
+        ? "metadata"
+        : "selection";
+    }
     case "call":
       if (failedRow?.reason === "argumentMismatch") return "arguments";
       // A transport-local code is OUR side, not the server's.
@@ -903,7 +1050,7 @@ export function deriveStageResults(
         case "discovery":
           return deriveDiscovery(evidence);
         case "selection":
-          return deriveSelection(evidence);
+          return deriveSelection(evidence, authored);
         case "call":
           return deriveCall(evidence, authored);
         default:
@@ -953,6 +1100,38 @@ export function deriveStageResults(
   return finalize(rows, evidence);
 }
 
+/**
+ * Merge D7's quoted evidence into the `selection` row, but ONLY when the
+ * resolved category actually landed on `metadata` — i.e. `categoryFor`'s
+ * `selection` branch consulted a scored+attributed verdict.
+ *
+ * Reuses `boundedJudgeReasons` and `evidence.predicateReasons` — the row
+ * refs' only free-text slot, same precedent `judgeEvidence` set for
+ * `userValue` — rather than a new field. Any `promptIndexes` already on the
+ * row (from `deriveSelection`'s `missingToolCall` / `unexpectedToolCall`) are
+ * preserved untouched: the judge explains WHY those turns failed, it does
+ * not relocate them. The row's own `reason` is never touched either.
+ *
+ * NO discard is needed on the way in, unlike `judgeEvidence`'s explicit strip
+ * in `deriveStageResults`: `categoryFor`'s `selection` branch is only ever
+ * reached when `firstFailedStage === "selection"`, which — by `finalize`'s
+ * own positional definition — means nothing upstream (`connection` /
+ * `discovery`) already broke. `metadataAttribution` can therefore never be
+ * consulted on a run whose chain broke before `selection` even ran.
+ */
+function mergeMetadataAttributionEvidence(
+  rows: readonly StageResultRow[],
+  metadataAttribution: StageEvidence["metadataAttribution"]
+): StageResultRow[] {
+  const reasonsEvidence = boundedJudgeReasons(metadataAttribution?.reasons);
+  if (!reasonsEvidence) return rows as StageResultRow[];
+  return rows.map((r) =>
+    r.stage === "selection"
+      ? { ...r, evidence: { ...r.evidence, ...reasonsEvidence } }
+      : r
+  );
+}
+
 function finalize(
   rows: StageResultRow[],
   evidence: StageEvidence,
@@ -961,8 +1140,12 @@ function finalize(
   const firstFailedStage = rows.find((r) => r.state === "failed")?.stage;
   const failureCategory =
     forcedCategory ?? categoryFor(firstFailedStage, rows, evidence);
+  const finalRows =
+    failureCategory === "metadata"
+      ? mergeMetadataAttributionEvidence(rows, evidence.metadataAttribution)
+      : rows;
   return {
-    stageResults: rows,
+    stageResults: finalRows,
     ...(firstFailedStage ? { firstFailedStage } : {}),
     ...(failureCategory ? { failureCategory } : {}),
     stageAnalyzerVersion: STAGE_ANALYZER_VERSION,

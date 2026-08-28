@@ -845,6 +845,67 @@ describe("run_eval_case host selection", () => {
   });
 });
 
+describe("per-run import approvals reach the launch", () => {
+  const APPROVALS = [
+    { testCaseId: "case-1", reason: "Reviewed against the upstream rubric" },
+  ];
+
+  it("forwards them from a SINGLE-CASE run", async () => {
+    const { client, fetchMock } = makeClient();
+    await runEvalCaseOperation.execute(
+      { suite: "Smoke", case: "echo works", importApprovals: APPROVALS },
+      { client },
+    );
+    // Without this the operation could never launch an `approximated` case:
+    // the platform refuses a selected approximation carrying no approval, so
+    // the one caller who explicitly approved it would still be refused.
+    expect(bodiesTo(fetchMock, "/eval-runs")).toEqual([
+      {
+        suiteId: "suite-1",
+        caseIds: ["case-1"],
+        importApprovals: APPROVALS,
+      },
+    ]);
+  });
+
+  it("forwards them from a SUITE run selecting the same one case", async () => {
+    const { client, fetchMock } = makeClient();
+    await runEvalCaseOperation.execute(
+      { suite: "Smoke", case: "echo works", importApprovals: APPROVALS },
+      { client },
+    );
+    const single = bodiesTo(fetchMock, "/eval-runs");
+    const suiteRun = makeClient();
+    await runEvalSuiteOperation.execute(
+      { suite: "Smoke", cases: ["echo works"], importApprovals: APPROVALS },
+      { client: suiteRun.client },
+    );
+    const viaSuite = bodiesTo(suiteRun.fetchMock, "/eval-runs") as Array<
+      Record<string, unknown>
+    >;
+    // The two ways of running ONE case must not disagree about whether it may
+    // run. Both carry the same approval to the same route.
+    const [viaCase] = single as Array<Record<string, unknown>>;
+    expect(viaCase?.importApprovals).toEqual(APPROVALS);
+    expect(viaSuite[0]?.importApprovals).toEqual(APPROVALS);
+  });
+
+  it("omits the key entirely when nothing was approved", async () => {
+    // Absent, never `[]`: an empty list would read as "somebody considered
+    // the approximations and approved none", which is a different statement
+    // from "no approval was part of this launch".
+    const { client, fetchMock } = makeClient();
+    await runEvalCaseOperation.execute(
+      { suite: "Smoke", case: "echo works" },
+      { client },
+    );
+    const [body] = bodiesTo(fetchMock, "/eval-runs") as Array<
+      Record<string, unknown>
+    >;
+    expect(body && "importApprovals" in body).toBe(false);
+  });
+});
+
 describe("run_eval_suite pre-run disclosure (G4b)", () => {
   it("fires onDisclosure before createEvalRun, and carries it on the receipt", async () => {
     const callOrder: string[] = [];
@@ -924,13 +985,13 @@ describe("run_eval_suite pre-run disclosure (G4b)", () => {
     }
   });
 
-  it("reports a host-targeted launch as unavailable instead of disclosing a misleading suite-base plan", async () => {
-    // The backend contract has no host selector, so sending none would
-    // silently return the SUITE-BASE disclosure and attach it to the
-    // receipt as if it described this launch — but a host config can pin
-    // its own model and harness, so the run could actually boot a different
-    // engine on a different model than a suite-base disclosure would claim.
-    // An honest absence beats a confident wrong answer.
+  it("DISCLOSES a single-host launch off the frozen plan's host (G4c un-refusal)", async () => {
+    // Before G4c this skipped the fetch: the contract took no host selector,
+    // so the only query available was the suite-BASE derivation, which a host
+    // config can contradict with its own model and harness — a run could be
+    // disclosed "emulated, no sandbox" while booting a harness sandbox. The
+    // contract now takes `namedHostId`, so the frozen plan's host is
+    // forwarded and the disclosure describes what actually runs.
     const { client } = makeClient({
       detail: suiteDetail({
         hosts: [{ id: "host-claude", name: "Claude" }],
@@ -948,10 +1009,45 @@ describe("run_eval_suite pre-run disclosure (G4b)", () => {
       },
     );
     expect(result.outcome).toBe("started");
+    expect(result.disclosure).toBeDefined();
+    expect(disclosureCalled).toBe(true);
+    expect(unavailableReason).toBeUndefined();
+    expect(disclosureSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ namedHostId: "host-claude" }),
+      expect.anything(),
+    );
+  });
+
+  it("still reports a MULTI-TARGET launch spanning hosts as unavailable — one plan, one disclosure", async () => {
+    // The remaining honest absence, and for a different reason than the
+    // retired one: the contract answers for ONE launch plan (its one-axis
+    // rule refuses a host alongside an environment selector), so a group
+    // spanning hosts has no single engine or model set to disclose. Stitching
+    // N round trips into a composite would be a different contract than the
+    // audit stamp records.
+    const { client } = makeClient({
+      detail: suiteDetail({
+        hosts: [
+          { id: "host-claude", name: "Claude" },
+          { id: "host-chatgpt", name: "ChatGPT" },
+        ],
+      }),
+    });
+    const disclosureSpy = vi.spyOn(client, "getEvalRunDisclosure");
+    let disclosureCalled = false;
+    let unavailableReason: string | undefined;
+    const result = await runEvalSuiteOperation.execute(
+      { suite: "Smoke", hosts: ["Claude", "ChatGPT"] },
+      {
+        client,
+        onDisclosure: () => (disclosureCalled = true),
+        onDisclosureUnavailable: (reason) => (unavailableReason = reason),
+      },
+    );
     expect(result.disclosure).toBeUndefined();
     expect(disclosureCalled).toBe(false);
-    expect(unavailableReason).toMatch(/host-targeted launch/);
-    // The fetch itself must never happen — there is no query it could send.
+    expect(unavailableReason).toMatch(/multi-target launch that includes a host/);
+    // The fetch itself must never happen — there is no single query for it.
     expect(disclosureSpy).not.toHaveBeenCalled();
   });
 
@@ -1142,36 +1238,61 @@ describe("get_eval_run_disclosure target resolution parity with run_eval_suite",
     );
   });
 
-  it("refuses a host-only suite with a single attached host, rather than the misleading suite-base derivation", async () => {
-    // This operation's input schema has no host selector at all, and the
-    // backend disclosure contract has no host parameter either — so unlike
-    // `run_eval_suite` (which still launches the auto-selected host, just
-    // without a disclosure), this operation has nothing to fall back to.
-    // Silently fetching with no selector would return the suite-base
-    // derivation and present it as if it described that host's launch,
-    // which a host config can override (its own model, its own harness).
+  it("AUTO-SELECTS a host-only suite's sole attached host and discloses it (G4c un-refusal)", async () => {
+    // Before G4c this refused: the backend contract took no host parameter,
+    // so the only query available was the selector-less suite-base
+    // derivation, which a host config can contradict with its own model and
+    // harness. `testSuites:getRunDisclosure` now takes `namedHostId`, so the
+    // auto-selected host is disclosed for real — the same auto-select rule
+    // `run_eval_suite` uses for a bare launch on this exact suite.
     const { client } = makeClient({
       detail: suiteDetail({
         hosts: [{ id: "host-claude", name: "Claude" }],
       }),
     });
     const spy = vi.spyOn(client, "getEvalRunDisclosure");
-    const error = await getEvalRunDisclosureOperation
-      .execute({ suite: "Smoke" }, { client })
-      .catch((caught: unknown) => caught as PlatformApiError);
-    expect(error).toBeInstanceOf(PlatformApiError);
-    expect((error as PlatformApiError).message).toMatch(/HOST-targeted/);
-    expect((error as PlatformApiError).message).toMatch(/"Claude"/);
-    expect(spy).not.toHaveBeenCalled();
+    await getEvalRunDisclosureOperation.execute({ suite: "Smoke" }, { client });
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        suiteId: "suite-1",
+        namedHostId: "host-claude",
+      }),
+      expect.anything(),
+    );
+    // ONE AXIS: never both, which the backend refuses outright.
+    expect(spy.mock.calls[0]![0]).not.toHaveProperty("environmentId");
+    expect(spy.mock.calls[0]![0]).not.toHaveProperty("environmentIds");
   });
 
-  it("refuses a suite with SEVERAL attached hosts and no environments — never the suite-base derivation", async () => {
-    // `computeRunTargets` reports this as `target-required` (ambiguous, same
-    // as `run_eval_suite` would refuse a bare launch here too) — but with
-    // zero attached environments, the ordinary TARGET_REQUIRED message (which
-    // only ever names environments) would tell the caller to "name one with
-    // environment" against an empty list. Must fall through to the same
-    // host-axis-unavailable refusal as the single-host case instead.
+  it("discloses the host a caller NAMES out of several attached hosts", async () => {
+    const { client } = makeClient({
+      detail: suiteDetail({
+        hosts: [
+          { id: "host-claude", name: "Claude" },
+          { id: "host-chatgpt", name: "ChatGPT" },
+        ],
+      }),
+    });
+    const spy = vi.spyOn(client, "getEvalRunDisclosure");
+    await getEvalRunDisclosureOperation.execute(
+      { suite: "Smoke", host: "ChatGPT" },
+      { client },
+    );
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        suiteId: "suite-1",
+        namedHostId: "host-chatgpt",
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("refuses SEVERAL attached hosts with no selector — and the refusal now names host, which a caller can actually apply", async () => {
+    // Still `target-required` (a bare `run_eval_suite` launch refuses here
+    // too, so parity holds), but no longer a dead end: before G4c this
+    // operation had no host selector, so the refusal could only say the axis
+    // was unavailable. Now it enumerates the attached hosts and names the
+    // selector that resolves them.
     const { client } = makeClient({
       detail: suiteDetail({
         hosts: [
@@ -1185,8 +1306,34 @@ describe("get_eval_run_disclosure target resolution parity with run_eval_suite",
       .execute({ suite: "Smoke" }, { client })
       .catch((caught: unknown) => caught as PlatformApiError);
     expect(error).toBeInstanceOf(PlatformApiError);
-    expect((error as PlatformApiError).message).toMatch(/HOST-targeted/);
-    expect((error as PlatformApiError).message).not.toMatch(/TARGET_REQUIRED/);
+    const message = (error as PlatformApiError).message;
+    expect(message).toMatch(/TARGET_REQUIRED/);
+    expect(message).toMatch(/"Claude"/);
+    expect(message).toMatch(/"ChatGPT"/);
+    expect(message).toMatch(/\bhost\b/);
+    // readOnly: this operation spends nothing and has no `allAttached`.
+    expect(message).not.toMatch(/allAttached/);
+    expect(message).not.toMatch(/PAID RUN/);
+    // No attached environments, so `environment` is not an applicable fix.
+    expect(message).not.toMatch(/Name one with environment/);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("refuses host together with environment — a plan resolves on one axis", async () => {
+    const { client } = makeClient({
+      detail: suiteDetail({
+        environmentIds: ["env-stg"],
+        hosts: [{ id: "host-claude", name: "Claude" }],
+      }),
+    });
+    const spy = vi.spyOn(client, "getEvalRunDisclosure");
+    const error = await getEvalRunDisclosureOperation
+      .execute({ suite: "Smoke", host: "Claude", environment: "Stg" }, { client })
+      .catch((caught: unknown) => caught as PlatformApiError);
+    expect(error).toBeInstanceOf(PlatformApiError);
+    expect((error as PlatformApiError).message).toMatch(
+      /environments or hosts, not both/,
+    );
     expect(spy).not.toHaveBeenCalled();
   });
 
@@ -1196,8 +1343,9 @@ describe("get_eval_run_disclosure target resolution parity with run_eval_suite",
     // attached" case in the `computeRunTargets` suite below) — a bare
     // `run_eval_suite` launch on this exact suite would refuse the same way,
     // so disclosure refusing too is the parity this operation exists to keep.
-    // The environment IS nameable here, so this gets the ordinary
-    // TARGET_REQUIRED message, not the host-axis-unavailable one.
+    // BOTH axes are nameable here since G4c, so the refusal enumerates both
+    // and names both selectors — every fix it suggests is one a caller can
+    // actually apply.
     const { client } = makeClient({
       detail: suiteDetail({
         environmentIds: ["env-stg"],
@@ -1209,8 +1357,14 @@ describe("get_eval_run_disclosure target resolution parity with run_eval_suite",
       .execute({ suite: "Smoke" }, { client })
       .catch((caught: unknown) => caught as PlatformApiError);
     expect(error).toBeInstanceOf(PlatformApiError);
-    expect((error as PlatformApiError).message).toMatch(/TARGET_REQUIRED/);
-    expect((error as PlatformApiError).message).not.toMatch(/HOST-targeted/);
+    const message = (error as PlatformApiError).message;
+    expect(message).toMatch(/TARGET_REQUIRED/);
+    expect(message).toMatch(/Name one with environment or host/);
+    expect(message).toMatch(/"Claude"/);
+    expect(message).toMatch(/env-stg/);
+    // readOnly wording throughout — this operation spends nothing.
+    expect(message).not.toMatch(/PAID RUN/);
+    expect(message).not.toMatch(/allAttached/);
     expect(spy).not.toHaveBeenCalled();
   });
 

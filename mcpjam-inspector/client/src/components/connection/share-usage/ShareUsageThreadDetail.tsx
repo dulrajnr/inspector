@@ -30,6 +30,7 @@ import {
   useSessionBrowserArtifacts,
   type SharedChatTurnTrace,
 } from "@/hooks/useSharedChatThreads";
+import { SessionUserValueChain } from "@/components/shared/user-value-chain/SessionUserValueChain";
 import { ErrorBoundary } from "@/components/ui/error-boundary";
 import { SessionScoredTranscript } from "@/components/connection/share-usage/session-scored-transcript";
 import {
@@ -468,6 +469,12 @@ export function ShareUsageThreadDetail({
     if (thread.sourceType === "swarm") {
       return (
         <div className="flex h-full flex-col">
+          {/* Same reasoning as the main body: a transcript-less attempt is
+              exactly where an unmeasured chain is the honest answer. */}
+          <SessionUserValueChain
+            derivation={thread.stageDerivation}
+            className="mx-3 mb-3"
+          />
           <SwarmJudgeSection threadId={threadId} goalScore={thread.goalScore} />
           <div className="flex flex-1 items-center justify-center">
             <p className="text-sm text-muted-foreground">
@@ -617,6 +624,17 @@ export function ShareUsageThreadDetail({
         </div>
       </div>
 
+      {/* D8: the chain EXPLAINS the outcome the surfaces above decided; it
+          never replaces one. Rendered unconditionally so a session with no
+          chain says "not measured" rather than vanishing — a panel that hides
+          itself when there is nothing reads as "nothing to report". */}
+      <SessionUserValueChain
+        derivation={thread.stageDerivation}
+        className="mx-3 mb-3"
+      />
+
+      {/* Swarm-only: render before the first score exists so deployments with
+          automatic judging disabled still expose the on-demand entry point. */}
       {thread.sourceType === "swarm" ? (
         <SwarmJudgeSection threadId={threadId} goalScore={thread.goalScore} />
       ) : null}
